@@ -1,0 +1,367 @@
+# ============================================================
+# IPsum blacklist importer for MikroTik RouterOS v7
+#
+# Source:
+# https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt
+#
+# Existing production address list:
+#   ipsum
+#
+# Temporary address list:
+#   ipsum-new
+#
+# Entries managed by this script use:
+#   comment="IPsum managed"
+#
+# Manually-added entries in list=ipsum with another comment
+# will NOT be removed.
+# ============================================================
+
+
+# -----------------------------
+# Configuration
+# -----------------------------
+
+:local url "https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt"
+:local fileName "ipsum-level3.txt"
+
+:local finalList "ipsum"
+:local tempList "ipsum-new"
+
+:local entryComment "IPsum managed"
+
+# Maximum supported /file read chunk size
+:local chunkSize 32768
+
+
+# -----------------------------
+# Start
+# -----------------------------
+
+:log info "IPsum: starting blacklist update"
+
+
+# -----------------------------
+# Remove old downloaded file
+# -----------------------------
+
+:if ([:len [/file find where name=$fileName]] > 0) do={
+    /file remove [find where name=$fileName]
+}
+
+
+# -----------------------------
+# Clean temporary address list
+# -----------------------------
+
+/ip firewall address-list remove [find where list=$tempList]
+
+
+# -----------------------------
+# Download new blacklist
+# -----------------------------
+
+:log info "IPsum: downloading blacklist"
+
+:local fetchOK false
+
+:onerror fetchError in={
+
+    :local fetchResult [/tool fetch \
+        url=$url \
+        dst-path=$fileName \
+        check-certificate=yes \
+        as-value]
+
+    :if (($fetchResult->"status") = "finished") do={
+        :set fetchOK true
+    }
+
+} do={
+
+    :log error ("IPsum: download failed - " . $fetchError)
+
+}
+
+
+# Stop if download failed
+:if (!$fetchOK) do={
+    :log error "IPsum: update aborted because download failed"
+    :error "IPsum download failed"
+}
+
+
+# -----------------------------
+# Verify downloaded file exists
+# -----------------------------
+
+:local fileID [/file find where name=$fileName]
+
+:if ([:len $fileID] = 0) do={
+    :log error "IPsum: downloaded file does not exist"
+    :error "IPsum file missing"
+}
+
+
+# -----------------------------
+# Get downloaded file size
+# -----------------------------
+
+:local fileSize [/file get $fileID size]
+
+:log info ("IPsum: downloaded " . $fileSize . " bytes")
+
+
+# Reject suspiciously small file
+:if ($fileSize < 1000) do={
+
+    :log error ("IPsum: downloaded file is unexpectedly small: " . $fileSize . " bytes")
+
+    /file remove $fileID
+
+    :error "IPsum downloaded file too small"
+}
+
+
+# -----------------------------
+# Parser variables
+# -----------------------------
+
+:local offset 0
+:local carry ""
+:local imported 0
+:local rejected 0
+
+
+# -----------------------------
+# Read file in chunks
+# -----------------------------
+
+:while ($offset < $fileSize) do={
+
+    :local readSize $chunkSize
+
+    # Reduce final chunk if necessary
+    :if (($offset + $readSize) > $fileSize) do={
+        :set readSize ($fileSize - $offset)
+    }
+
+
+    # -----------------------------
+    # Read chunk
+    #
+    # IMPORTANT:
+    # as-value is required so that
+    # ($readResult->"data") works.
+    # -----------------------------
+
+    :local readResult [/file read \
+        file=$fileName \
+        offset=$offset \
+        chunk-size=$readSize \
+        as-value]
+
+    :local data ($readResult->"data")
+
+
+    # -----------------------------
+    # Combine previous incomplete
+    # line with new chunk
+    # -----------------------------
+
+    :set data ($carry . $data)
+    :set carry ""
+
+
+    # -----------------------------
+    # Parse newline-separated IPs
+    # -----------------------------
+
+    :local position 0
+    :local dataLength [:len $data]
+    :local lineEnd [:find $data "\n" $position]
+
+
+    :while ([:typeof $lineEnd] != "nil") do={
+
+        :local line [:pick $data $position $lineEnd]
+
+
+        # -----------------------------
+        # Remove CR from CRLF lines
+        # -----------------------------
+
+        :if ([:len $line] > 0) do={
+
+            :if ([:pick $line ([:len $line] - 1) [:len $line]] = "\r") do={
+                :set line [:pick $line 0 ([:len $line] - 1)]
+            }
+        }
+
+
+        # -----------------------------
+        # Add address
+        # -----------------------------
+
+        :if ([:len $line] > 0) do={
+
+            :local addOK true
+
+            :onerror addError in={
+
+                /ip firewall address-list add \
+                    list=$tempList \
+                    address=$line \
+                    comment=$entryComment
+
+            } do={
+
+                :set addOK false
+
+            }
+
+
+            :if ($addOK) do={
+
+                :set imported ($imported + 1)
+
+            } else={
+
+                :set rejected ($rejected + 1)
+                :log warning ("IPsum: rejected invalid entry: " . $line)
+
+            }
+        }
+
+
+        # Move to next line
+        :set position ($lineEnd + 1)
+        :set lineEnd [:find $data "\n" $position]
+    }
+
+
+    # -----------------------------
+    # Save incomplete final line
+    # for the next chunk
+    # -----------------------------
+
+    :if ($position < $dataLength) do={
+        :set carry [:pick $data $position $dataLength]
+    }
+
+
+    # Advance offset
+    :set offset ($offset + $readSize)
+}
+
+
+# -----------------------------
+# Process final leftover line
+# if file does not end in newline
+# -----------------------------
+
+:if ([:len $carry] > 0) do={
+
+    # Remove possible CR
+    :if ([:pick $carry ([:len $carry] - 1) [:len $carry]] = "\r") do={
+        :set carry [:pick $carry 0 ([:len $carry] - 1)]
+    }
+
+
+    :local addOK true
+
+    :onerror addError in={
+
+        /ip firewall address-list add \
+            list=$tempList \
+            address=$carry \
+            comment=$entryComment
+
+    } do={
+
+        :set addOK false
+
+    }
+
+
+    :if ($addOK) do={
+
+        :set imported ($imported + 1)
+
+    } else={
+
+        :set rejected ($rejected + 1)
+        :log warning ("IPsum: rejected invalid final entry: " . $carry)
+
+    }
+}
+
+
+# -----------------------------
+# Sanity check
+#
+# If fewer than 1000 entries
+# imported, keep the old list.
+# -----------------------------
+
+:if ($imported < 1000) do={
+
+    :log error ("IPsum: only " . $imported . " addresses imported - keeping existing blacklist")
+
+    /ip firewall address-list remove [find where list=$tempList]
+
+    :if ([:len [/file find where name=$fileName]] > 0) do={
+        /file remove [find where name=$fileName]
+    }
+
+    :error "IPsum import sanity check failed"
+}
+
+
+# -----------------------------
+# Import successful
+# -----------------------------
+
+:log info ("IPsum: successfully parsed " . $imported . " addresses")
+
+:if ($rejected > 0) do={
+    :log warning ("IPsum: rejected " . $rejected . " invalid entries")
+}
+
+
+# -----------------------------
+# Remove previous managed IPsum
+# entries from production list
+# -----------------------------
+
+:log info "IPsum: replacing existing managed blacklist"
+
+/ip firewall address-list remove [
+    find where list=$finalList comment=$entryComment
+]
+
+
+# -----------------------------
+# Move temporary entries into
+# production list
+# -----------------------------
+
+/ip firewall address-list set \
+    [find where list=$tempList] \
+    list=$finalList
+
+
+# -----------------------------
+# Delete downloaded file
+# -----------------------------
+
+:if ([:len [/file find where name=$fileName]] > 0) do={
+    /file remove [find where name=$fileName]
+}
+
+
+# -----------------------------
+# Finished
+# -----------------------------
+
+:log info ("IPsum: update complete - imported=" . $imported . " rejected=" . $rejected)
